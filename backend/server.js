@@ -116,6 +116,7 @@ const transporter = nodemailer.createTransport({
   maxConnections: 3,
   connectionTimeout: 15000,
   socketTimeout: 30000,
+  family: 4,
 });
 
 transporter.verify((error) => {
