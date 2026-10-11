@@ -2,7 +2,6 @@ require("dotenv").config();
 
 const crypto = require("crypto");
 const express = require("express");
-const nodemailer = require("nodemailer");
 const cors = require("cors");
 const cron = require("node-cron");
 const { createClient } = require("@supabase/supabase-js");
@@ -15,8 +14,7 @@ const PORT = process.env.PORT || 5000;
 const IS_PROD = process.env.NODE_ENV === "production";
 
 const {
-  EMAIL_USER,
-  EMAIL_PASS,
+  RESEND_API_KEY,
   API_SECRET_KEY,
   SUPABASE_URL,
   SUPABASE_SERVICE_ROLE_KEY,
@@ -28,15 +26,13 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
   .filter(Boolean);
 
 const ALLOW_LEGACY_API_KEY = process.env.ALLOW_LEGACY_API_KEY !== "false";
-
 const STRICT_RECIPIENTS = process.env.STRICT_RECIPIENTS !== "false";
-
 const SEND_LIMIT_PER_MIN = Number(process.env.SEND_LIMIT_PER_MIN || 10);
 const BRAND_NAME = "NextStep Mentors";
 
+// Updated required environment variables (removed Gmail SMTP items, added Resend)
 const missing = [
-  "EMAIL_USER",
-  "EMAIL_PASS",
+  "RESEND_API_KEY",
   "API_SECRET_KEY",
   "SUPABASE_URL",
   "SUPABASE_SERVICE_ROLE_KEY",
@@ -65,14 +61,12 @@ const esc = (v = "") =>
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;");
 
-// Constant-time string compare (avoids timing attacks on the API key).
 const safeEqual = (a, b) => {
   const x = Buffer.from(String(a || ""));
   const y = Buffer.from(String(b || ""));
   return x.length === y.length && crypto.timingSafeEqual(x, y);
 };
 
-// Strip CR/LF so a value can never inject extra email headers.
 const oneLine = (v) => String(v || "").replace(/[\r\n]+/g, " ").trim();
 
 const maskEmail = (e = "") => {
@@ -100,28 +94,11 @@ const getFullName = (profile, fallback = "there") => {
 };
 
 /* =========================================================
-   SUPABASE + MAILER
+   SUPABASE
 ========================================================= */
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
   auth: { autoRefreshToken: false, persistSession: false },
-});
-
-const transporter = nodemailer.createTransport({
-  host: "smtp.gmail.com",
-  port: 587,
-  secure: false,
-  auth: { user: EMAIL_USER, pass: EMAIL_PASS },
-  pool: true,
-  maxConnections: 3,
-  connectionTimeout: 15000,
-  socketTimeout: 30000,
-  family: 4,
-});
-
-transporter.verify((error) => {
-  if (error) console.error("SMTP configuration error:", error.message);
-  else console.log("SMTP transporter ready.");
 });
 
 /* =========================================================
@@ -130,7 +107,7 @@ transporter.verify((error) => {
 
 const app = express();
 app.disable("x-powered-by");
-app.set("trust proxy", 1); // correct client IPs behind Render/Railway/Nginx
+app.set("trust proxy", 1);
 
 app.use((req, res, next) => {
   res.setHeader("X-Content-Type-Options", "nosniff");
@@ -148,8 +125,6 @@ app.use(
 
 app.use(express.json({ limit: "200kb" }));
 
-/* ---------- tiny in-memory rate limiter ---------- */
-
 const buckets = new Map();
 
 const rateLimiter = ({ windowMs, max, key }) => (req, res, next) => {
@@ -165,14 +140,6 @@ const rateLimiter = ({ windowMs, max, key }) => (req, res, next) => {
   next();
 };
 
-setInterval(() => {
-  const cutoff = Date.now() - 10 * 60 * 1000;
-  for (const [k, hits] of buckets) {
-    if (!hits.length || hits[hits.length - 1] < cutoff) buckets.delete(k);
-  }
-}, 5 * 60 * 1000).unref();
-
-// Slows brute-forcing of the API key / tokens by IP.
 const ipLimiter = rateLimiter({
   windowMs: 60_000,
   max: 60,
@@ -183,7 +150,6 @@ app.use(ipLimiter);
 
 /* ---------- auth ---------- */
 
-// Server-to-server / admin routes: shared secret in x-api-key.
 const requireApiKey = (req, res, next) => {
   if (!safeEqual(req.headers["x-api-key"], API_SECRET_KEY)) {
     return res.status(401).json({ error: "Unauthorized" });
@@ -191,7 +157,6 @@ const requireApiKey = (req, res, next) => {
   next();
 };
 
-// Verifies the caller's Supabase access token.
 const verifyToken = async (req) => {
   const header = req.headers.authorization || "";
   if (!header.startsWith("Bearer ")) return null;
@@ -209,13 +174,9 @@ const getUserEmail = async (userId) => {
     const { data, error } = await supabase.rpc("get_user_email", {
       p_user_id: userId,
     });
-    if (error) {
-      console.error(`get_user_email failed (${userId}):`, error.message);
-      return null;
-    }
+    if (error) return null;
     return data || null;
-  } catch (err) {
-    console.error(`get_user_email exception (${userId}):`, err.message);
+  } catch {
     return null;
   }
 };
@@ -226,18 +187,13 @@ const getProfile = async (userId) => {
     const { data, error } = await supabase.rpc("get_user_profile", {
       p_user_id: userId,
     });
-    if (error) {
-      console.error(`get_user_profile failed (${userId}):`, error.message);
-      return null;
-    }
+    if (error) return null;
     return data?.[0] || null;
-  } catch (err) {
-    console.error(`get_user_profile exception (${userId}):`, err.message);
+  } catch {
     return null;
   }
 };
 
-// Role lookup with a 60s cache so each email doesn't cost a DB round trip.
 const roleCache = new Map();
 const getRole = async (userId) => {
   const hit = roleCache.get(userId);
@@ -245,7 +201,6 @@ const getRole = async (userId) => {
 
   let role = (await getProfile(userId))?.role;
   if (!role) {
-    // Works once SUPABASE_SERVICE_ROLE_KEY is the real service_role key.
     const { data } = await supabase
       .from("profiles")
       .select("role")
@@ -259,7 +214,7 @@ const getRole = async (userId) => {
 };
 
 /* =========================================================
-   HEALTH (public, minimal)
+   HEALTH
 ========================================================= */
 
 app.get("/health", async (req, res) => {
@@ -274,10 +229,9 @@ app.get("/health", async (req, res) => {
 });
 
 /* =========================================================
-   SEND EMAIL
+   SEND EMAIL (Resend API Integration)
 ========================================================= */
 
-// Accepts a Supabase user token (preferred). Legacy x-api-key only if enabled.
 const authenticateSender = async (req, res, next) => {
   try {
     const user = await verifyToken(req);
@@ -290,8 +244,7 @@ const authenticateSender = async (req, res, next) => {
       return next();
     }
     return res.status(401).json({ error: "Unauthorized" });
-  } catch (err) {
-    console.error("Auth error:", err.message);
+  } catch {
     return res.status(401).json({ error: "Unauthorized" });
   }
 };
@@ -322,7 +275,6 @@ app.post("/send-email", authenticateSender, userLimiter, async (req, res) => {
 
   const recipient = to.trim().toLowerCase();
 
-  // Recipient policy: regular users may only email themselves.
   if (STRICT_RECIPIENTS && req.user) {
     const isSelf = recipient === String(req.user.email || "").toLowerCase();
     if (!isSelf && (await getRole(req.user.id)) !== "admin") {
@@ -331,20 +283,36 @@ app.post("/send-email", authenticateSender, userLimiter, async (req, res) => {
   }
 
   try {
-    const info = await transporter.sendMail({
-      from: `"${BRAND_NAME}" <${EMAIL_USER}>`,
-      to: recipient,
-      subject: oneLine(subject),
-      text,
-      html,
+    // Dispatch email using Resend HTTP API
+    const response = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${RESEND_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        // Note: Resend requires onboarding@resend.dev until you verify your own domain
+        from: `${BRAND_NAME} <onboarding@resend.dev>`,
+        to: [recipient],
+        subject: oneLine(subject),
+        html: html,
+        text: text,
+      }),
     });
 
-    console.log("Email sent:", {
+    const data = await response.json();
+
+    if (!response.ok) {
+      throw new Error(data.message || "Failed to send via Resend");
+    }
+
+    console.log("Email sent via Resend:", {
       to: maskEmail(recipient),
       by: req.user?.id || "legacy-key",
-      messageId: info.messageId,
+      id: data.id,
     });
-    return res.status(200).json({ success: true, messageId: info.messageId });
+
+    return res.status(200).json({ success: true, messageId: data.id });
   } catch (err) {
     console.error("Send email failed:", err.message);
     return res.status(500).json({ error: "Failed to send email" });
@@ -355,7 +323,7 @@ app.post("/send-email", authenticateSender, userLimiter, async (req, res) => {
    REMINDER EMAILS
 ========================================================= */
 
-const sendReminderEmail = ({
+const sendReminderEmail = async ({
   email,
   recipientName,
   otherName,
@@ -377,7 +345,6 @@ ${sessionLink ? `Join: ${sessionLink}` : "No meeting link has been added yet. Pl
 
 ${BRAND_NAME}`;
 
-  // Only allow http(s) links in the button.
   const safeLink = /^https?:\/\//i.test(sessionLink || "") ? sessionLink : null;
 
   const html = `
@@ -395,13 +362,24 @@ ${BRAND_NAME}`;
   <p>Thank you,<br><strong>${BRAND_NAME}</strong></p>
 </div>`;
 
-  return transporter.sendMail({
-    from: `"${BRAND_NAME}" <${EMAIL_USER}>`,
-    to: email,
-    subject: `Reminder: your session starts ${soon}`,
-    text,
-    html,
+  const response = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${RESEND_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      from: `${BRAND_NAME} <onboarding@resend.dev>`,
+      to: [email],
+      subject: `Reminder: your session starts ${soon}`,
+      html: html,
+      text: text,
+    }),
   });
+
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.message || "Resend reminder failed");
+  return data;
 };
 
 const sendAppointmentReminder = async (appt) => {
@@ -444,12 +422,8 @@ const sendAppointmentReminder = async (appt) => {
     });
   }
 
-  if (!jobs.length) {
-    console.error(`[${appt.id}] No email addresses found.`);
-    return { attempted: 0, successful: 0, failed: 0 };
-  }
+  if (!jobs.length) return { attempted: 0, successful: 0, failed: 0 };
 
-  // Send both in parallel; one failure must not block the other.
   const results = await Promise.allSettled(jobs.map((j) => j.run()));
   let successful = 0;
   results.forEach((r, i) => {
@@ -479,34 +453,21 @@ const checkAppointmentReminders = async () => {
       { p_now: now.toISOString(), p_until: until.toISOString() },
     );
 
-    if (error) {
-      console.error("Fetching reminder appointments failed:", error.message);
-      return;
-    }
-    if (!appointments?.length) return;
-
-    console.log(`Reminders due: ${appointments.length}`);
+    if (error || !appointments?.length) return;
 
     for (const appt of appointments) {
-      // Atomically claim so two server instances never double-send.
       const { data: claimed, error: claimError } = await supabase.rpc(
         "mark_reminder_sent",
         { p_appointment_id: appt.id },
       );
-      if (claimError) {
-        console.error(`[${appt.id}] Claim failed:`, claimError.message);
-        continue;
-      }
-      if (!claimed) continue;
+      if (claimError || !claimed) continue;
 
       try {
         const result = await sendAppointmentReminder(appt);
         if (result.successful === 0) {
           await supabase.rpc("reset_reminder", { p_appointment_id: appt.id });
-          console.warn(`[${appt.id}] Nothing sent, reminder reset for retry.`);
         }
-      } catch (err) {
-        console.error(`[${appt.id}] Reminder failed:`, err.message);
+      } catch {
         await supabase.rpc("reset_reminder", { p_appointment_id: appt.id });
       }
     }
@@ -524,83 +485,16 @@ const reminderTask = cron.schedule(
 );
 
 /* =========================================================
-   ADMIN / DIAGNOSTIC ROUTES (API key only, never from the app)
-========================================================= */
-
-app.get("/database-status", requireApiKey, async (req, res) => {
-  const count = async (filter) => {
-    let q = supabase.from("appointments").select("id", { count: "exact", head: true });
-    if (filter) q = filter(q);
-    const { count: c, error } = await q;
-    if (error) throw error;
-    return c || 0;
-  };
-
-  try {
-    const [total, scheduled, reminderSent] = await Promise.all([
-      count(),
-      count((q) => q.eq("status", "scheduled")),
-      count((q) => q.eq("reminder_email_sent", true)),
-    ]);
-
-    res.json({
-      success: true,
-      databaseConnected: true,
-      counts: { total, scheduled, reminderSent, reminderNotSent: total - reminderSent },
-    });
-  } catch (err) {
-    console.error("database-status failed:", err.message);
-    res.status(500).json({ success: false, databaseConnected: false });
-  }
-});
-
-app.post("/run-reminder-check", requireApiKey, async (req, res) => {
-  await checkAppointmentReminders();
-  res.json({ success: true, message: "Reminder check completed." });
-});
-
-/* =========================================================
-   404 + ERROR HANDLING
-========================================================= */
-
-app.use((req, res) => res.status(404).json({ error: "Not found" }));
-
-// eslint-disable-next-line no-unused-vars
-app.use((err, req, res, next) => {
-  if (err.type === "entity.too.large") {
-    return res.status(413).json({ error: "Payload too large" });
-  }
-  if (err instanceof SyntaxError && "body" in err) {
-    return res.status(400).json({ error: "Invalid JSON" });
-  }
-  console.error("Unhandled error:", err.message);
-  res.status(500).json({ error: "Internal server error" });
-});
-
-process.on("uncaughtException", (err) => console.error("Uncaught exception:", err));
-process.on("unhandledRejection", (reason) => console.error("Unhandled rejection:", reason));
-
-/* =========================================================
-   START + SHUTDOWN
+   SERVER START
 ========================================================= */
 
 const server = app.listen(PORT, "0.0.0.0", () => {
   console.log(`Email service listening on port ${PORT} (${IS_PROD ? "production" : "development"})`);
-  if (ALLOW_LEGACY_API_KEY) {
-    console.warn("ALLOW_LEGACY_API_KEY is on: /send-email still accepts the app's shared key.");
-  }
-  if (!STRICT_RECIPIENTS) console.warn("STRICT_RECIPIENTS is off: users can email anyone.");
 });
 
-server.keepAliveTimeout = 65000;
-server.headersTimeout = 66000;
-
 const shutdown = (signal) => {
-  console.log(`\n${signal} received, shutting down...`);
   reminderTask.stop();
-  transporter.close();
   server.close(() => process.exit(0));
-  setTimeout(() => process.exit(1), 10000).unref();
 };
 
 process.on("SIGINT", () => shutdown("SIGINT"));
