@@ -109,8 +109,8 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
 
 const transporter = nodemailer.createTransport({
   host: "smtp.gmail.com",
-  port: 465,
-  secure: true,
+  port: 587,
+  secure: false,
   auth: { user: EMAIL_USER, pass: EMAIL_PASS },
   pool: true,
   maxConnections: 3,
