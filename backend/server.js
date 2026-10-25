@@ -136,6 +136,7 @@ const deliver = async ({ to, subject, html, text }) => {
     }),
   });
 
+  console.log("Sent from:", RESEND_FROM, "to:", to, "subject:", subject);
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
     throw new Error(data.message || `Resend HTTP ${response.status}`);
