@@ -17,15 +17,14 @@ const IS_PROD = process.env.NODE_ENV === "production";
 const {
   RESEND_API_KEY,
   RESEND_FROM,
-  EMAIL_USER,
-  EMAIL_PASS,
   API_SECRET_KEY,
   SUPABASE_URL,
   SUPABASE_SERVICE_ROLE_KEY,
 } = process.env;
 
 const RESEND_ENABLED = Boolean(RESEND_API_KEY);
-const SMTP_ENABLED = Boolean(EMAIL_USER && EMAIL_PASS);
+// SMTP is permanently removed as requested; Resend is the sole email provider.
+const SMTP_ENABLED = false;
 
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
   .split(",")
@@ -45,9 +44,8 @@ const missing = [
   "SUPABASE_SERVICE_ROLE_KEY",
 ].filter((k) => !process.env[k]);
 
-// At least one email provider must be configured.
-if (!RESEND_ENABLED && !SMTP_ENABLED) {
-  missing.push("RESEND_API_KEY or EMAIL_USER/EMAIL_PASS");
+if (!RESEND_ENABLED) {
+  missing.push("RESEND_API_KEY");
 }
 
 if (missing.length) {
@@ -115,81 +113,34 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
   auth: { autoRefreshToken: false, persistSession: false },
 });
 
-// SMTP (Gmail) transporter: only created when credentials exist.
-const transporter = SMTP_ENABLED
-  ? nodemailer.createTransport({
-      host: "smtp.gmail.com",
-      port: 465,
-      secure: true,
-      auth: { user: EMAIL_USER, pass: EMAIL_PASS },
-      pool: true,
-      maxConnections: 3,
-      connectionTimeout: 15000,
-      socketTimeout: 30000,
-    })
-  : null;
-
-if (transporter) {
-  transporter.verify((error) => {
-    if (error) console.error("SMTP configuration error:", error.message);
-    else console.log("SMTP transporter ready.");
-  });
-}
+// Transporter stub eliminated since SMTP has been fully removed.
+const transporter = null;
 
 /**
- * Sends one email. Tries Resend first, then falls back to SMTP.
- * Throws only if every configured provider failed.
+ * Sends one email exclusively through Resend using the verified domain.
+ * Throws if the Resend API call fails.
  */
 const deliver = async ({ to, subject, html, text }) => {
-  let resendError = null;
-
-  if (RESEND_ENABLED) {
-    try {
-      const response = await fetch("https://api.resend.com/emails", {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${RESEND_API_KEY}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          from: RESEND_FROM || `${BRAND_NAME} <onboarding@resend.dev>`,
-          to: [to],
-          subject,
-          html,
-          text,
-        }),
-      });
-
-      const data = await response.json().catch(() => ({}));
-      if (!response.ok) {
-        throw new Error(data.message || `Resend HTTP ${response.status}`);
-      }
-      return { provider: "resend", id: data.id };
-    } catch (err) {
-      resendError = err;
-      console.warn("Resend failed:", err.message);
-      if (!transporter) throw err; // no fallback available
-      console.warn("Falling back to SMTP...");
-    }
-  }
-
-  try {
-    const info = await transporter.sendMail({
-      from: `"${BRAND_NAME}" <${EMAIL_USER}>`,
-      to,
+  const response = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${RESEND_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      from: RESEND_FROM || `${BRAND_NAME} <noreply@desolnurturersltd.co.ke>`,
+      to: [to],
       subject,
-      text,
       html,
-    });
-    return { provider: "smtp", id: info.messageId };
-  } catch (err) {
-    if (resendError) {
-      throw new Error(
-        `All providers failed. Resend: ${resendError.message} | SMTP: ${err.message}`,
-      );
-    }
-    throw err;
+      text,
+    }),
+  });
+
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(data.message || `Resend HTTP ${response.status}`);
   }
+  return { provider: "resend", id: data.id };
 };
 
 /* =========================================================
@@ -313,7 +264,6 @@ const getRole = async (userId) => {
 
   let role = (await getProfile(userId))?.role;
   if (!role) {
-    // Works once SUPABASE_SERVICE_ROLE_KEY is the real service_role key.
     const { data } = await supabase
       .from("profiles")
       .select("role")
@@ -337,7 +287,7 @@ app.get("/health", async (req, res) => {
 
   res.status(error ? 503 : 200).json({
     status: error ? "error" : "ok",
-    providers: { resend: RESEND_ENABLED, smtp: SMTP_ENABLED },
+    providers: { resend: RESEND_ENABLED, smtp: false },
     time: new Date().toISOString(),
   });
 });
@@ -346,7 +296,6 @@ app.get("/health", async (req, res) => {
    SEND EMAIL
 ========================================================= */
 
-// Accepts a Supabase user token (preferred). Legacy x-api-key only if enabled.
 const authenticateSender = async (req, res, next) => {
   try {
     const user = await verifyToken(req);
@@ -404,7 +353,6 @@ app.post("/send-email", authenticateSender, userLimiter, async (req, res) => {
 
   const recipient = to.trim().toLowerCase();
 
-  // Recipient policy: regular users may only email themselves.
   if (STRICT_RECIPIENTS && req.user) {
     const isSelf = recipient === String(req.user.email || "").toLowerCase();
     if (!isSelf && (await getRole(req.user.id)) !== "admin") {
@@ -439,6 +387,89 @@ app.post("/send-email", authenticateSender, userLimiter, async (req, res) => {
   }
 });
 
+app.post(
+  "/notify-counselor-booking",
+  authenticateSender,
+  userLimiter,
+  async (req, res) => {
+    if (!req.user) return res.status(401).json({ error: "Unauthorized" });
+
+    const { appointmentId } = req.body || {};
+    if (typeof appointmentId !== "string" || appointmentId.length > 64) {
+      return res.status(400).json({ error: "appointmentId is required." });
+    }
+
+    try {
+      const { data: appt, error } = await supabase
+        .from("appointments")
+        .select(
+          "id, client_id, counselor_id, counseling_type, scheduled_start_time, created_at",
+        )
+        .eq("id", appointmentId)
+        .maybeSingle();
+
+      if (error || !appt) {
+        return res.status(404).json({ error: "Appointment not found." });
+      }
+
+      if (appt.client_id !== req.user.id) {
+        return res.status(403).json({ error: "Not your appointment." });
+      }
+
+      if (Date.now() - new Date(appt.created_at).getTime() > 15 * 60 * 1000) {
+        return res.status(400).json({ error: "Booking is too old to notify." });
+      }
+
+      const [counselorEmail, counselorProfile, clientProfile] =
+        await Promise.all([
+          getUserEmail(appt.counselor_id),
+          getProfile(appt.counselor_id),
+          getProfile(appt.client_id),
+        ]);
+
+      if (!counselorEmail) {
+        return res.status(404).json({ error: "Counselor email not found." });
+      }
+
+      const counselorName = counselorProfile?.first_name || "there";
+      const clientName = getFullName(clientProfile, "A client");
+      const when = formatAppointmentTime(appt.scheduled_start_time);
+
+      const text = `Hi ${counselorName}, ${clientName} booked a ${appt.counseling_type} session for ${when}. Open the app to view intake details and add the meeting link.`;
+
+      const html = `
+        <div style="font-family:Arial,sans-serif;line-height:1.6;color:#333">
+          <h2>New appointment</h2>
+          <p>Hi ${esc(counselorName)}, a client has booked a session with you.</p>
+          <table>
+            <tr><td style="padding:4px 12px 4px 0;color:#64748B">Client</td><td><strong>${esc(clientName)}</strong></td></tr>
+            <tr><td style="padding:4px 12px 4px 0;color:#64748B">Type</td><td><strong>${esc(appt.counseling_type)}</strong></td></tr>
+            <tr><td style="padding:4px 12px 4px 0;color:#64748B">When</td><td><strong>${esc(when)}</strong></td></tr>
+          </table>
+          <p>Open the app to view intake details and add the meeting link.</p>
+          <p>Thank you,<br><strong>${BRAND_NAME}</strong></p>
+        </div>`;
+
+      const result = await deliver({
+        to: counselorEmail.toLowerCase(),
+        subject: "New appointment booked with you",
+        text,
+        html,
+      });
+
+      console.log("Counselor booking email sent:", {
+        provider: result.provider,
+        to: maskEmail(counselorEmail),
+        appt: appt.id,
+      });
+      return res.json({ success: true, provider: result.provider });
+    } catch (err) {
+      console.error("notify-counselor-booking failed:", err.message);
+      return res.status(500).json({ error: "Failed to send email" });
+    }
+  },
+);
+
 /* =========================================================
    REMINDER EMAILS
 ========================================================= */
@@ -465,7 +496,6 @@ ${sessionLink ? `Join: ${sessionLink}` : "No meeting link has been added yet. Pl
 
 ${BRAND_NAME}`;
 
-  // Only allow http(s) links in the button.
   const safeLink = /^https?:\/\//i.test(sessionLink || "") ? sessionLink : null;
 
   const html = `
@@ -548,7 +578,6 @@ const sendAppointmentReminder = async (appt) => {
     return { attempted: 0, successful: 0, failed: 0 };
   }
 
-  // Send both in parallel; one failure must not block the other.
   const results = await Promise.allSettled(jobs.map((j) => j.run()));
   let successful = 0;
   results.forEach((r, i) => {
@@ -596,7 +625,6 @@ const checkAppointmentReminders = async () => {
     console.log(`Reminders due: ${appointments.length}`);
 
     for (const appt of appointments) {
-      // Atomically claim so two server instances never double-send.
       const { data: claimed, error: claimError } = await supabase.rpc(
         "mark_reminder_sent",
         { p_appointment_id: appt.id },
@@ -631,7 +659,7 @@ const reminderTask = cron.schedule("* * * * *", checkAppointmentReminders, {
 });
 
 /* =========================================================
-   ADMIN / DIAGNOSTIC ROUTES (API key only, never from the app)
+   ADMIN / DIAGNOSTIC ROUTES
 ========================================================= */
 
 app.get("/database-status", requireApiKey, async (req, res) => {
@@ -706,7 +734,7 @@ const server = app.listen(PORT, "0.0.0.0", () => {
   console.log(
     `Email service listening on port ${PORT} (${IS_PROD ? "production" : "development"})`,
   );
-  console.log(`Providers: resend=${RESEND_ENABLED} smtp=${SMTP_ENABLED}`);
+  console.log(`Providers: resend=${RESEND_ENABLED} smtp=false`);
   if (ALLOW_LEGACY_API_KEY) {
     console.warn(
       "ALLOW_LEGACY_API_KEY is on: /send-email still accepts the app's shared key.",
@@ -723,7 +751,6 @@ server.headersTimeout = 66000;
 const shutdown = (signal) => {
   console.log(`\n${signal} received, shutting down...`);
   reminderTask.stop();
-  if (transporter) transporter.close();
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(1), 10000).unref();
 };
